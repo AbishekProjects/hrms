@@ -5,9 +5,12 @@ import datetime
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import cint, flt, get_link_to_form
+from frappe.utils import cint, flt, formatdate, getdate
 
-from hrms.hr.doctype.leave_application.leave_application import get_leave_balance_on
+from hrms.hr.doctype.leave_application.leave_application import (
+	get_leave_allocation_records,
+	get_leave_balance_on,
+)
 from hrms.hr.doctype.leave_ledger_entry.leave_ledger_entry import create_leave_ledger_entry
 
 
@@ -21,15 +24,15 @@ class LeaveAdjustment(Document):
 		from frappe.types import DF
 
 		adjustment_type: DF.Literal["", "Allocate", "Reduce"]
-		allocated_leaves: DF.Float
 		amended_from: DF.Link | None
 		company: DF.Link | None
+		balance_after_adjustment: DF.Float
+		balance_before_adjustment: DF.Float
 		employee: DF.Link
 		employee_name: DF.Data | None
 		from_date: DF.Date | None
 		leave_allocation: DF.Link
 		leave_type: DF.Link
-		leaves_after_adjustment: DF.Float
 		leaves_to_adjust: DF.Float
 		naming_series: DF.Literal["HR-LAD-.YYYY.-"]
 		posting_date: DF.Date
@@ -42,33 +45,38 @@ class LeaveAdjustment(Document):
 		precision = self.precision("leaves_to_adjust") or system_precision
 		self.leaves_to_adjust = flt(self.leaves_to_adjust, precision)
 
-	def before_save(self):
-		self.set_leaves_after_adjustment()
-
-	def set_leaves_after_adjustment(self):
-		if self.adjustment_type == "Allocate":
-			self.leaves_after_adjustment = flt(self.allocated_leaves) + flt(self.leaves_to_adjust)
-		elif self.adjustment_type == "Reduce":
-			self.leaves_after_adjustment = flt(self.allocated_leaves) - flt(self.leaves_to_adjust)
-
 	def validate(self):
-		self.validate_duplicate_leave_adjustment()
 		self.validate_non_zero_adjustment()
+		self.validate_posting_date()
+		self.set_leave_balances()
 		self.validate_over_allocation()
 		self.validate_leave_balance()
 
-	def validate_duplicate_leave_adjustment(self):
-		duplicate_adjustment = frappe.db.exists(
-			"Leave Adjustment",
-			{"employee": self.employee, "leave_allocation": self.leave_allocation, "docstatus": 1},
-		)
-		if duplicate_adjustment:
+	def validate_posting_date(self):
+		"""Ledger entry starts on posting date, so it has to fall inside the allocation period"""
+		if not (self.from_date and self.to_date):
+			return
+
+		if not (getdate(self.from_date) <= getdate(self.posting_date) <= getdate(self.to_date)):
 			frappe.throw(
-				title=_("Duplicate Leave Adjustment"),
-				msg=_(
-					"Leave Adjustment for this allocation already exists: {0}. Please amend existing adjustment."
-				).format(get_link_to_form("Leave Adjustment", duplicate_adjustment)),
+				_("Posting Date {0} must be within the allocation period {1} - {2}").format(
+					frappe.bold(formatdate(self.posting_date)),
+					formatdate(self.from_date),
+					formatdate(self.to_date),
+				)
 			)
+
+	def set_leave_balances(self):
+		"""Balance is read from the ledger as on posting date, not from the allocation document"""
+		self.balance_before_adjustment = flt(
+			get_leave_balance_on(
+				employee=self.employee, leave_type=self.leave_type, date=self.posting_date
+			)
+		)
+		adjustment = flt(self.leaves_to_adjust)
+		if self.adjustment_type == "Reduce":
+			adjustment = -1 * adjustment
+		self.balance_after_adjustment = self.balance_before_adjustment + adjustment
 
 	def validate_non_zero_adjustment(self):
 		if self.leaves_to_adjust == 0:
@@ -79,10 +87,15 @@ class LeaveAdjustment(Document):
 			return
 
 		max_leaves_allowed = frappe.db.get_value("Leave Type", self.leave_type, "max_leaves_allowed")
+		if not max_leaves_allowed:
+			return
 
-		new_allocation = flt(self.allocated_leaves) + flt(self.leaves_to_adjust)
+		allocation = get_leave_allocation_records(self.employee, self.posting_date, self.leave_type).get(
+			self.leave_type, frappe._dict()
+		)
+		new_allocation = flt(allocation.get("total_leaves_allocated")) + flt(self.leaves_to_adjust)
 
-		if max_leaves_allowed and (new_allocation > max_leaves_allowed):
+		if new_allocation > max_leaves_allowed:
 			frappe.throw(
 				_("Allocation is greater than the maximum allowed {0} for leave type {1}").format(
 					frappe.bold(max_leaves_allowed), frappe.bold(self.leave_type)
@@ -93,14 +106,12 @@ class LeaveAdjustment(Document):
 		if self.adjustment_type == "Allocate":
 			return
 
-		leave_balance = get_leave_balance_on(
-			employee=self.employee, leave_type=self.leave_type, date=self.posting_date
-		)
-
-		if leave_balance < self.leaves_to_adjust:
+		if self.balance_before_adjustment < self.leaves_to_adjust:
 			frappe.throw(
 				_("Reduction is more than {0}'s available leave balance {1} for leave type {2}").format(
-					frappe.bold(self.employee_name), frappe.bold(leave_balance), frappe.bold(self.leave_type)
+					frappe.bold(self.employee_name),
+					frappe.bold(self.balance_before_adjustment),
+					frappe.bold(self.leave_type),
 				)
 			)
 
@@ -117,7 +128,7 @@ class LeaveAdjustment(Document):
 			leaves=self.leaves_to_adjust
 			if self.adjustment_type == "Allocate"
 			else (-1 * self.leaves_to_adjust),
-			from_date=self.from_date,
+			from_date=self.posting_date,
 			to_date=self.to_date,
 			is_lwp=is_lwp,
 		)

@@ -27,12 +27,76 @@ class TestLeaveAdjustment(HRMSTestSuite):
 		)
 		self.leave_allocation.submit()
 
-	def test_duplicate_leave_adjustment(self):
+	def test_multiple_adjustments_for_same_allocation(self):
 		create_leave_adjustment(self.leave_allocation, adjustment_type="Reduce", leaves_to_adjust=3).submit()
-		duplicate_adjustment = create_leave_adjustment(
-			self.leave_allocation, adjustment_type="Allocate", leaves_to_adjust=10
+		create_leave_adjustment(
+			self.leave_allocation, adjustment_type="Allocate", leaves_to_adjust=2
+		).submit()
+
+		leave_balance = get_leave_balance_on(
+			employee=self.employee.name, leave_type="_Test Leave Type", date=getdate()
 		)
-		self.assertRaises(frappe.ValidationError, duplicate_adjustment.save)
+		self.assertEqual(leave_balance, 9)
+
+	def test_ledger_entry_starts_on_posting_date(self):
+		posting_date = add_days(get_first_day(getdate()), 10)
+		adjustment = create_leave_adjustment(
+			self.leave_allocation, adjustment_type="Allocate", leaves_to_adjust=5, posting_date=posting_date
+		)
+		adjustment.submit()
+
+		ledger_from_date = frappe.db.get_value(
+			"Leave Ledger Entry", {"transaction_name": adjustment.name}, "from_date"
+		)
+		self.assertEqual(getdate(ledger_from_date), getdate(posting_date))
+
+		# balance before the posting date is untouched
+		balance_before_posting = get_leave_balance_on(
+			employee=self.employee.name,
+			leave_type="_Test Leave Type",
+			date=add_days(posting_date, -1),
+		)
+		self.assertEqual(balance_before_posting, 10)
+
+	def test_balance_before_and_after_are_read_from_ledger(self):
+		create_leave_adjustment(
+			self.leave_allocation, adjustment_type="Allocate", leaves_to_adjust=4
+		).submit()
+		adjustment = create_leave_adjustment(
+			self.leave_allocation, adjustment_type="Reduce", leaves_to_adjust=3
+		)
+		adjustment.submit()
+
+		self.assertEqual(adjustment.balance_before_adjustment, 14)
+		self.assertEqual(adjustment.balance_after_adjustment, 11)
+
+	def test_posting_date_outside_allocation_period(self):
+		adjustment = create_leave_adjustment(
+			self.leave_allocation,
+			adjustment_type="Allocate",
+			leaves_to_adjust=1,
+			posting_date=add_days(get_last_day(getdate()), 1),
+		)
+		adjustment.from_date = self.leave_allocation.from_date
+		adjustment.to_date = self.leave_allocation.to_date
+		self.assertRaises(frappe.ValidationError, adjustment.save)
+
+	def test_over_allocation_considers_earlier_adjustments(self):
+		leave_type = create_leave_type(leave_type_name="Test Over Allocation 2", max_leaves_allowed=30)
+		leave_allocation = create_leave_allocation(
+			employee=self.employee.name,
+			employee_name=self.employee.employee_name,
+			leave_type=leave_type.name,
+			new_leaves_allocated=25,
+		)
+		leave_allocation.submit()
+		create_leave_adjustment(leave_allocation, adjustment_type="Allocate", leaves_to_adjust=4).submit()
+
+		# 25 + 4 already on ledger, 3 more crosses the max of 30
+		leave_adjustment = create_leave_adjustment(
+			leave_allocation, adjustment_type="Allocate", leaves_to_adjust=3
+		)
+		self.assertRaises(frappe.ValidationError, leave_adjustment.save)
 
 	def test_adjustment_for_over_allocation(self):
 		leave_type = create_leave_type(leave_type_name="Test Over Allocation", max_leaves_allowed=30)

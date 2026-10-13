@@ -72,6 +72,21 @@ class LeaveAllocation(Document):
 		unused_leaves: DF.Float
 	# end: auto-generated types
 
+	def onload(self):
+		if self.docstatus == 1:
+			self.set_onload("net_leave_adjustment", self.get_net_leave_adjustment())
+
+	def get_net_leave_adjustment(self) -> float:
+		"""Net leaves added (+) or removed (-) by submitted Leave Adjustments against this allocation"""
+		adjustments = frappe.get_all(
+			"Leave Adjustment",
+			filters={"leave_allocation": self.name, "docstatus": 1},
+			fields=["adjustment_type", "leaves_to_adjust"],
+		)
+		return sum(
+			flt(d.leaves_to_adjust) * (-1 if d.adjustment_type == "Reduce" else 1) for d in adjustments
+		)
+
 	def validate(self):
 		self.validate_period()
 		self.validate_allocation_overlap()

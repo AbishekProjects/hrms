@@ -31,6 +31,7 @@ frappe.ui.form.on("Leave Allocation", {
 	refresh: function (frm) {
 		hrms.leave_utils.add_view_ledger_button(frm);
 		hrms.leave_utils.add_leave_balance_button(frm);
+		frm.trigger("show_adjusted_total");
 
 		if (frm.doc.docstatus === 1 && !frm.doc.expired) {
 			var valid_expiry = moment(frappe.datetime.get_today()).isBetween(
@@ -108,6 +109,21 @@ frappe.ui.form.on("Leave Allocation", {
 		}
 		frm.trigger("set_indicator");
 		frm.trigger("toggle_retry_button");
+	},
+
+	show_adjusted_total: function (frm) {
+		const net_adjustment = flt(frm.doc.__onload?.net_leave_adjustment);
+		if (frm.doc.docstatus !== 1 || !net_adjustment) return;
+
+		const adjusted_total = flt(frm.doc.total_leaves_allocated) + net_adjustment;
+		frm.dashboard.add_indicator(
+			__("Total After Adjustments: {0} ({1}{2})", [
+				adjusted_total,
+				net_adjustment > 0 ? "+" : "",
+				net_adjustment,
+			]),
+			net_adjustment > 0 ? "green" : "orange",
+		);
 	},
 
 	expire_allocation: function (frm) {
